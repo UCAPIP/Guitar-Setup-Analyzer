@@ -1,0 +1,72 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<script src="https://cdn.jsdelivr.net/npm/streamlit-component-lib@2.0.0/dist/streamlit-component-lib.js"></script>
+<style>body{margin:0;background:transparent;font-family:Arial,sans-serif}</style>
+</head>
+<body>
+<svg id="neck" width="640" height="300" viewBox="0 0 640 300"></svg>
+<script>
+const NS='http://www.w3.org/2000/svg';
+const svg=document.getElementById('neck');
+const NUT=46, END=610, TOP=38, BOT=262, FRETS=15;
+let selected=null;
+
+function fretX(i){
+  const p=1-1/Math.pow(2,i/12), pe=1-1/Math.pow(2,FRETS/12);
+  return NUT+(END-NUT)*(p/pe);
+}
+function el(t,a){const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);svg.appendChild(e);return e;}
+
+// фон и накладка
+const defs=el('defs',{});
+defs.innerHTML='<linearGradient id="w" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#6b3d1f"/><stop offset="1" stop-color="#4a2812"/></linearGradient>';
+el('rect',{x:NUT-10,y:TOP-16,width:END-NUT+20,height:BOT-TOP+32,rx:14,fill:'url(#w)'});
+el('rect',{x:0,y:TOP-16,width:NUT,height:BOT-TOP+32,rx:6,fill:'#c98a4b'}); // голова грифа
+el('rect',{x:NUT-6,y:TOP-12,width:6,height:BOT-TOP+24,fill:'#e8e8e8'});   // нулевой порожек
+
+// лады
+for(let i=1;i<=FRETS;i++){const x=fretX(i);el('line',{x1:x,y1:TOP-8,x2:x,y2:BOT+8,stroke:'#cfd4da','stroke-width':2.2});}
+// точки
+[3,5,7,9].forEach(f=>{const x=(fretX(f-1)+fretX(f))/2;el('circle',{cx:x,cy:(TOP+BOT)/2,r:7,fill:'#d9d9d9'});});
+[12].forEach(f=>{const x=(fretX(f-1)+fretX(f))/2;el('circle',{cx:x,cy:(TOP+BOT)/2-40,r:7,fill:'#d9d9d9'});el('circle',{cx:x,cy:(TOP+BOT)/2+40,r:7,fill:'#d9d9d9'});});
+
+// струны (1 сверху, 6 снизу)
+const strings={};
+for(let s=1;s<=6;s++){
+  const y=TOP+(s-1)*(BOT-TOP)/5;
+  const w=1+(6-s)*0.9;
+  const line=el('line',{x1:NUT-6,y1:y,x2:END,y2:y,stroke:s<=2?'#e6e6e6':'#b8b8b8','stroke-width':w});
+  const hit=el('line',{x1:NUT-6,y1:y,x2:END,y2:y,stroke:'rgba(0,0,0,0)','stroke-width':20});
+  hit.style.cursor='pointer';
+  hit.addEventListener('click',()=>{selected=s;paint();send(s);});
+  const lab=el('text',{x:NUT-20,y:y+4,'font-size':12,fill:'#fff','text-anchor':'middle'});
+  lab.textContent=s;
+  strings[s]={line,hit};
+}
+
+function paint(){
+  for(let s=1;s<=6;s++){
+    const L=strings[s].line;
+    if(s===selected){L.setAttribute('stroke','#ff8c00');L.setAttribute('stroke-width',4);L.style.filter='drop-shadow(0 0 6px #ff8c00)';}
+    else{L.setAttribute('stroke',s<=2?'#e6e6e6':'#b8b8b8');L.setAttribute('stroke-width',1+(6-s)*0.9);L.style.filter='none';}
+  }
+}
+
+function send(v){
+  if(window.Streamlit&&Streamlit.setComponentValue){Streamlit.setComponentValue(v);}
+  else{const cid=new URLSearchParams(location.search).get('componentId');
+       parent.postMessage({type:'setComponentValue',componentId:cid,data:v},'*');}
+}
+window.addEventListener('message',e=>{
+  if(e.data.type==='streamlit:render'){
+    selected=e.data.args?e.data.args.selected_string:selected;
+    paint();
+    if(window.Streamlit&&Streamlit.setFrameHeight)Streamlit.setFrameHeight(310);
+  }
+});
+if(window.Streamlit&&Streamlit.setFrameHeight)Streamlit.setFrameHeight(310);
+</script>
+</body>
+</html>
