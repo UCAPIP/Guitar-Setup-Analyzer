@@ -13,7 +13,7 @@ except ImportError:
 # ============ КОНСТАНТЫ ============
 SR, BLOCK, BUFFER_SEC = 44100, 2048, 4
 RMS_QUIET, RMS_LOUD = 0.003, 0.30
-RMS_HARM_QUIET = 0.001  # флажолет тише обычной ноты
+RMS_HARM_QUIET = 0.001
 STANDARD_TUNING = {6: 82.41, 5: 110.00, 4: 146.83, 3: 196.00, 2: 246.94, 1: 329.63}
 
 # ============ АУДИО-ДВИЖОК ============
@@ -73,8 +73,9 @@ def cents(f_meas, f_target):
 
 def buzz_metrics(y, f0):
     atk = y[:int(SR * 0.12)]
-    cent = float(librosa.feature.spectral_centroid(atk, sr=SR)[0].mean())
-    zcr = float(librosa.feature.zero_crossing_rate(atk)[0].mean())
+    # ИСПРАВЛЕНО: keyword-only аргументы для librosa 0.10+
+    cent = float(librosa.feature.spectral_centroid(y=atk, sr=SR)[0].mean())
+    zcr = float(librosa.feature.zero_crossing_rate(y=atk)[0].mean())
     S = np.abs(librosa.stft(atk))
     fr = librosa.fft_frequencies(sr=SR)
     he = float(S[fr > 2000].sum())
@@ -85,7 +86,6 @@ def buzz_metrics(y, f0):
 
 # ============ LIVE-ЗАХВАТ ============
 def live_capture(rec, title, f_target=None, timeout=25, is_harmonic=False):
-    """is_harmonic=True снижает порог RMS для флажолетов."""
     st.subheader(title)
     ph = st.empty()
     stable, t0 = [], time.time()
@@ -137,7 +137,7 @@ def capture_fret_buzz(rec, fret, timeout=25):
         time.sleep(0.1)
     return {'fret': fret, 'is_buzz': False, 'bend': 0.0, 'f0': None}
 
-# ============ ВЫБОР СТРУНЫ С ПОДСВЕТКОЙ ============
+# ============ ВЫБОР СТРУНЫ ============
 def pick_string(current):
     st.markdown("**Выберите струну:**")
     cols = st.columns(6)
@@ -177,13 +177,10 @@ if sd is None:
     st.error("Не найден sounddevice. Выполните: py -m pip install sounddevice")
     st.stop()
 
-# Инициализация состояния
 if 'results' not in st.session_state: st.session_state.results = {}
 if 'step' not in st.session_state: st.session_state.step = 1
 if 'string' not in st.session_state: st.session_state.string = 6
-if 'substep' not in st.session_state: st.session_state.substep = 'a'  # для шага 2
 
-# ============ ВЫБОР УСТРОЙСТВА ============
 all_devs = sd.query_devices()
 input_devs = [(i, d) for i, d in enumerate(all_devs) if d['max_input_channels'] > 0]
 if not input_devs:
@@ -213,13 +210,10 @@ channel = st.sidebar.radio("Канал", [0, 1], index=0,
                            help="0 = INSTRUMENT/Line 1, 1 = Line 2")
 st.sidebar.caption(f"Устройство №{device_index}: {input_devs[sel][1]['name']}")
 
-# ============ ВЫБОР СТРУНЫ (всегда виден) ============
 string_num = pick_string(st.session_state.string)
 if string_num != st.session_state.string:
     st.session_state.string = string_num
-    # Сброс при смене струны
     st.session_state.step = 1
-    st.session_state.substep = 'a'
     if string_num not in st.session_state.results:
         st.session_state.results[string_num] = {'buzz': {}}
 
@@ -229,11 +223,8 @@ fresh = st.sidebar.checkbox("Струны свежие (<2 недель)", value
 if not fresh:
     st.sidebar.warning("⚠️ На старых струнах точность падает.")
 
-# ============ ОТЛАДОЧНАЯ ПАНЕЛЬ ============
 with st.sidebar.expander("🔧 Отладка", expanded=False):
-    st.write(f"**Текущая струна:** {string_num}")
-    st.write(f"**Шаг:** {st.session_state.step}")
-    st.write(f"**Подшаг:** {st.session_state.substep}")
+    st.write(f"**Струна:** {string_num}, **Шаг:** {st.session_state.step}")
     st.write(f"**res keys:** {list(res.keys())}")
     if 'open' in res: st.write(f"  open.f0 = {res['open']['f0']:.2f}")
     if 'harm' in res: st.write(f"  harm.f0 = {res['harm']['f0']:.2f}")
@@ -242,12 +233,10 @@ with st.sidebar.expander("🔧 Отладка", expanded=False):
     st.write(f"**buzz:** {list(res['buzz'].keys())}")
     if st.button("🔄 Сбросить состояние"):
         st.session_state.step = 1
-        st.session_state.substep = 'a'
         if string_num in st.session_state.results:
             del st.session_state.results[string_num]
         st.rerun()
 
-# ============ ЗАПУСК АУДИО ============
 rec = MicRecorder(device=device_index, channel=channel)
 rec.start()
 
@@ -258,14 +247,14 @@ try:
             r = live_capture(rec, f"Шаг 1. Сыграйте открытую {string_num}-ю струну", target)
             if r:
                 res['open'] = r
-                st.session_state.step = 2
-                st.session_state.substep = 'a'
                 st.rerun()
         else:
-            st.success(f"✅ Открытая струна: {res['open']['f0']:.2f} Гц")
-            if st.button("Перейти к Шагу 2 →"):
+            st.success(f"✅ Открытая струна: {res['open']['f0']:.2f} Гц ({res['open'].get('cents', 0):+.1f} центов)")
+            st.markdown("---")
+            st.markdown("**Готовы перейти к Шагу 2 (диагностика мензуры)?**")
+            st.caption("На этом шаге мы сравним флажолет на 12 ладу с зажатой нотой на 12 ладу.")
+            if st.button("✅ Да, перейти к Шагу 2 →", type="primary"):
                 st.session_state.step = 2
-                st.session_state.substep = 'a'
                 st.rerun()
 
     # ШАГ 2: Мензура
@@ -276,35 +265,56 @@ try:
         st.caption("Абсолютная точность не важна — сравниваем флажолет и зажатую ноту между собой.")
         
         # 2а: Флажолет
-        if st.session_state.substep == 'a':
-            if 'harm' not in res:
-                r1 = live_capture(rec, "Шаг 2а. Флажолет на 12 ладу", open_f0 * 2, is_harmonic=True)
-                if r1:
-                    res['harm'] = r1
-                    st.session_state.substep = 'b'
-                    st.rerun()
-            else:
-                st.success(f"✅ Флажолет: {res['harm']['f0']:.2f} Гц")
-                if st.button("Перейти к Шагу 2б →"):
-                    st.session_state.substep = 'b'
-                    st.rerun()
+        if 'harm' not in res:
+            r1 = live_capture(rec, "Шаг 2а. Флажолет на 12 ладу", open_f0 * 2, is_harmonic=True)
+            if r1:
+                res['harm'] = r1
+                st.rerun()
+        else:
+            st.success(f"✅ Флажолет зафиксирован: **{res['harm']['f0']:.2f} Гц**")
+            st.markdown("---")
+            st.markdown("**Готовы перейти к Шагу 2б (зажатая нота на 12 ладу)?**")
+            st.caption("Зажмите струну на 12 ладу и сыграйте. Не давите слишком сильно!")
+            if st.button("✅ Да, перейти к Шагу 2б →", type="primary"):
+                st.session_state.step = 2.5  # промежуточный статус
+                st.rerun()
+
+    # ШАГ 2.5: Зажатая нота
+    elif st.session_state.step == 2.5:
+        open_f0 = res['open']['f0']
+        st.markdown(f"✅ Флажолет: **{res['harm']['f0']:.2f} Гц**")
         
-        # 2б: Зажатая нота
-        elif st.session_state.substep == 'b':
-            st.markdown(f"✅ Флажолет зафиксирован: **{res['harm']['f0']:.2f} Гц**")
-            if 'fretted' not in res:
-                r2 = live_capture(rec, "Шаг 2б. Зажатая нота на 12 ладу", open_f0 * 2)
-                if r2:
-                    res['fretted'] = r2
-                    res['intonation'] = cents(r2['f0'], res['harm']['f0'])
-                    st.session_state.step = 3
+        if 'fretted' not in res:
+            r2 = live_capture(rec, "Шаг 2б. Зажатая нота на 12 ладу", open_f0 * 2)
+            if r2:
+                res['fretted'] = r2
+                res['intonation'] = cents(r2['f0'], res['harm']['f0'])
+                st.rerun()
+        else:
+            # Показываем сырые данные для диагностики
+            st.markdown("### Результаты Шага 2")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Флажолет F0", f"{res['harm']['f0']:.2f} Гц")
+            col2.metric("Зажатая F0", f"{res['fretted']['f0']:.2f} Гц")
+            col3.metric("Дельта мензуры", f"{res['intonation']:+.1f} центов")
+            
+            # Проверка на подозрительные данные
+            if abs(res['intonation']) < 0.5:
+                st.warning("⚠️ Дельта = 0.0 центов. Это подозрительно — возможно, обе ноты записались одинаково. Попробуйте перемерить.")
+                if st.button("🔄 Перемерить Шаг 2"):
+                    if 'harm' in res: del res['harm']
+                    if 'fretted' in res: del res['fretted']
+                    if 'intonation' in res: del res['intonation']
                     st.rerun()
             else:
-                st.success(f"✅ Зажатая нота: {res['fretted']['f0']:.2f} Гц")
-                st.markdown(f"**Дельта мензуры:** {res['intonation']:+.1f} центов")
-                if st.button("Перейти к Шагу 3 →"):
-                    st.session_state.step = 3
-                    st.rerun()
+                st.success("✅ Шаг 2 завершён.")
+            
+            st.markdown("---")
+            st.markdown("**Готовы перейти к Шагу 3 (диагностика дребезга)?**")
+            st.caption("На этом шаге мы проверим лады 1, 5, 7, 9 на наличие дребезга.")
+            if st.button("✅ Да, перейти к Шагу 3 →", type="primary"):
+                st.session_state.step = 3
+                st.rerun()
 
     # ШАГ 3: Дребезг
     elif st.session_state.step == 3:
@@ -348,5 +358,4 @@ if len(res['buzz']) >= 4:
     if st.button("🔄 Начать заново для этой струны"):
         del st.session_state.results[string_num]
         st.session_state.step = 1
-        st.session_state.substep = 'a'
         st.rerun()
