@@ -21,8 +21,10 @@ NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 class MicRecorder:
     def __init__(self, device=None, channel=0):
         self.channel = channel
-        self.buf = deque(maxlen=int(SR * BUFFER_SEC))
+        self.sr = SR
+        self.buf = deque(maxlen=int(SR * BUFFER_SEC / BLOCK) + 4)
         configs = [(SR, 1), (SR, 2), (48000, 1), (48000, 2), (96000, 1)]
+        self.stream = None
         for sr, ch in configs:
             try:
                 self.stream = sd.InputStream(samplerate=sr, channels=ch, dtype='float32',
@@ -30,65 +32,90 @@ class MicRecorder:
                 self.sr = sr
                 self.channels = ch
                 break
-            except sd.PortAudioError:
+            except Exception:
                 continue
-        else:
+        if self.stream is None:
             raise RuntimeError("Не удалось открыть аудиоустройство")
+        # буфер в блоках, пересчитываем под реальную частоту
+        self.buf = deque(maxlen=int(self.sr * BUFFER_SEC / BLOCK) + 4)
+        self.stream.start()
 
     def _cb(self, indata, frames, t, status):
         if indata.shape[1] > 1:
             ch = min(self.channel, indata.shape[1] - 1)
-            self.buf.append(indata[:, ch].astype(np.float32))
+            self.buf.append(indata[:, ch].copy())
         else:
             self.buf.append(indata[:, 0].copy())
 
-    def start(self): self.stream.start()
     def stop(self):
-        try: self.stream.stop(); self.stream.close()
-        except Exception: pass
+        try:
+            self.stream.stop()
+            self.stream.close()
+        except Exception:
+            pass
 
     def window(self, seconds=1.5):
-        data = np.concatenate(list(self.buf)) if self.buf else np.zeros(1, np.float32)
+        blocks = list(self.buf)
+        data = np.concatenate(blocks) if blocks else np.zeros(1, np.float32)
         n = int(self.sr * seconds)
-        return data[-n:] if len(data) >= n else np.pad(data, (0, n - len(data)))
+        return data[-n:] if len(data) >= n else np.pad(data, (n - len(data), 0))
+
+    def filled_seconds(self):
+        return sum(len(b) for b in list(self.buf)) / self.sr
+
+
+@st.cache_resource
+def get_recorder(device):
+    """Один рекордер на устройство — не пересоздаётся при каждом rerun."""
+    return MicRecorder(device=device, channel=0)
 
 # ============ DSP ============
-def highpass(y, cutoff=70):
-    b, a = butter(5, cutoff / (SR / 2), 'high')
+def highpass(y, sr, cutoff=70):
+    b, a = butter(4, cutoff / (sr / 2), 'high')
     return lfilter(b, a, y)
 
-def get_pitch(y, fmin=65, fmax=1200):
-    y = highpass(y)
-    start = int(SR * 0.06)
-    seg = y[start:start + int(SR * 0.45)]
-    if len(seg) < SR * 0.2:
+def get_pitch(y, sr, fmin=65, fmax=1200):
+    if len(y) < sr * 0.2:
         return None, 0.0
-    f0, _, vp = librosa.pyin(seg, fmin=fmin, fmax=fmax, sr=SR, frame_length=2048)
-    if np.all(np.isnan(f0)):
+    y = highpass(y, sr)
+    start = int(sr * 0.05)
+    seg = y[start:start + int(sr * 0.5)]
+    if len(seg) < sr * 0.2 or np.max(np.abs(seg)) < 1e-5:
         return None, 0.0
-    return float(np.nanmedian(f0)), float(np.nanmean(vp[~np.isnan(vp)]))
+    try:
+        f0, voiced, vp = librosa.pyin(seg, fmin=fmin, fmax=fmax, sr=sr,
+                                      frame_length=4096, hop_length=512)
+    except Exception:
+        return None, 0.0
+    ok = ~np.isnan(f0)
+    if not ok.any():
+        return None, 0.0
+    conf = float(np.nanmean(vp[ok])) if np.any(~np.isnan(vp[ok])) else 0.0
+    return float(np.median(f0[ok])), conf
 
 def cents(f_meas, f_target):
-    if not f_meas or not f_target: return 0.0
+    if not f_meas or not f_target:
+        return 0.0
     return 1200 * np.log2(f_meas / f_target)
 
 def freq_to_note(f):
     if not f or f < 20:
         return None, 0, 0
     midi = 69 + 12 * np.log2(f / 440.0)
-    midi_round = round(midi)
-    note_idx = midi_round % 12
+    midi_round = int(round(midi))
+    note_name = NOTE_NAMES[midi_round % 12]
     octave = (midi_round // 12) - 1
-    note_name = NOTE_NAMES[note_idx]
     center_freq = 440.0 * 2 ** ((midi_round - 69) / 12)
     return note_name, octave, center_freq
 
-def buzz_metrics(y, f0):
-    atk = y[:int(SR * 0.12)]
-    cent = float(librosa.feature.spectral_centroid(y=atk, sr=SR)[0].mean())
+def buzz_metrics(y, f0, sr):
+    atk = y[:int(sr * 0.12)]
+    if len(atk) < 512:
+        return False, 0.0, 0.0, 0.0
+    cent = float(librosa.feature.spectral_centroid(y=atk, sr=sr)[0].mean())
     zcr = float(librosa.feature.zero_crossing_rate(y=atk)[0].mean())
     S = np.abs(librosa.stft(atk))
-    fr = librosa.fft_frequencies(sr=SR)
+    fr = librosa.fft_frequencies(sr=sr)
     he = float(S[fr > 2000].sum())
     fe = float(S[(fr > f0 * 0.9) & (fr < f0 * 1.1)].sum()) if f0 else 1.0
     ratio = he / (fe + 1e-6)
@@ -101,12 +128,12 @@ def live_capture(rec, title, f_target=None, timeout=25, is_harmonic=False):
     ph = st.empty()
     stable, t0 = [], time.time()
     quiet_threshold = RMS_HARM_QUIET if is_harmonic else RMS_QUIET
-    
+
     while time.time() - t0 < timeout:
-        w = rec.window(1.5)
+        w = rec.window(1.0)
         rms = float(np.sqrt(np.mean(w ** 2)))
-        fmin = max(65, (f_target or 82) * 0.8)
-        f0, conf = get_pitch(w, fmin=fmin, fmax=(f_target or 330) * 3)
+        fmin = max(60, (f_target or 82) * 0.8)
+        f0, conf = get_pitch(w, rec.sr, fmin=fmin, fmax=(f_target or 330) * 3)
         c = cents(f0, f_target) if (f0 and f_target) else None
         f0_str = f"{f0:.1f}" if f0 is not None else "—"
         c_str = f"{c:+.1f}" if c is not None else "—"
@@ -115,13 +142,13 @@ def live_capture(rec, title, f_target=None, timeout=25, is_harmonic=False):
         elif rms < quiet_threshold: msg += f"\n\n🔇 Не слышно. Играйте громче (порог: {quiet_threshold:.4f})."
         elif f0 is None: msg += "\n\n🎵 Ищу питч... тяните ноту длиннее."
         ph.markdown(msg)
-        
+
         if f0 and conf > 0.4 and rms > quiet_threshold:
             stable.append(c if c is not None else 0)
             if len(stable) >= 6 and np.std(stable[-6:]) < 5:
                 ph.markdown(f"✅ **Замер зафиксирован: {f0:.1f} Гц**")
                 return {'f0': f0, 'cents': c, 'rms': rms}
-        time.sleep(0.25)
+        time.sleep(0.2)
     ph.markdown("⏱️ Таймаут. Сыграйте ровнее и попробуйте ещё раз.")
     return None
 
@@ -129,62 +156,58 @@ def capture_fret_buzz(rec, fret, timeout=25):
     st.caption(f"Лад {fret}: ударьте по струне")
     ph = st.empty()
     prev, t0 = 0.0, time.time()
+    sr = rec.sr
+    # ждём тишину, чтобы поймать именно новую атаку
     while time.time() - t0 < timeout:
-        w = rec.window(1.5)
+        w = rec.window(0.1)
         rms = float(np.sqrt(np.mean(w ** 2)))
         ph.markdown(f"Лад {fret}: ждём атаку... RMS {rms:.4f}")
-        if rms > RMS_QUIET and prev < RMS_QUIET:
-            time.sleep(0.5)
-            w2 = rec.window(0.8)
-            f0, _ = get_pitch(w2)
-            is_buzz, cent, zcr, ratio = buzz_metrics(w2, f0)
+        if rms > RMS_QUIET and prev < RMS_QUIET and (time.time() - t0) > 0.5:
+            time.sleep(0.6)
+            w2 = rec.window(0.9)
+            # атака примерно в начале окна 0.9 с (0.6 с назад + запас)
+            f0, _ = get_pitch(w2, sr)
+            is_buzz, cent, zcr, ratio = buzz_metrics(w2, f0, sr)
             bend = 0.0
-            f_atk, _ = get_pitch(w2[:int(SR * 0.08)])
-            if f0 and f_atk: bend = cents(f_atk, f0)
+            f_atk, _ = get_pitch(w2[:int(sr * 0.3)], sr)
+            if f0 and f_atk:
+                bend = cents(f_atk, f0)
             ph.markdown(f"Лад {fret}: {'🔴 Дребезг' if is_buzz else '🟢 Чисто'} "
                         f"(центроид {cent:.0f}, ratio {ratio:.2f}, bend {bend:+.1f})")
-            return {'fret': fret, 'is_buzz': is_buzz, 'bend': bend, 'f0': f0}
+            return {'fret': fret, 'is_buzz': is_buzz, 'bend': bend, 'f0': f0, 'centroid': cent}
         prev = rms
-        time.sleep(0.1)
-    return {'fret': fret, 'is_buzz': False, 'bend': 0.0, 'f0': None}
+        time.sleep(0.05)
+    return {'fret': fret, 'is_buzz': False, 'bend': 0.0, 'f0': None, 'centroid': 0.0}
 
-# ============ ТЮНЕР (всегда виден) ============
+# ============ ТЮНЕР ============
 def render_tuner(rec):
-    """Рендерит тюнер. Более чувствительные пороги."""
     w = rec.window(0.8)
     rms = float(np.sqrt(np.mean(w ** 2)))
-    f0, conf = get_pitch(w, fmin=65, fmax=1200)
-    
-    # Сниженные пороги для лучшей чувствительности
+    f0, conf = get_pitch(w, rec.sr, fmin=65, fmax=1200)
+
     if f0 and conf > 0.3 and rms > 0.001:
         note, octave, center = freq_to_note(f0)
         c = cents(f0, center)
-        
+
         if abs(c) < 2:
-            color = "#00ff00"
-            status = "✅ В ноте"
+            color, status = "#00ff00", "✅ В ноте"
         elif abs(c) < 10:
-            color = "#ffaa00"
-            status = "⚠️ Близко"
+            color, status = "#ffaa00", "⚠️ Близко"
         else:
-            color = "#ff4444"
-            status = "❌ Далеко"
-        
-        max_cents = 50
-        normalized = max(-1.0, min(1.0, c / max_cents))
-        bar_pos = 50.0 + (normalized * 50.0)
-        
+            color, status = "#ff4444", "❌ Далеко"
+
+        normalized = max(-1.0, min(1.0, c / 50))
+        bar_pos = 50.0 + normalized * 50.0
+
         st.markdown(f"""
         <div style="background: #1e1e1e; padding: 20px; border-radius: 10px; text-align: center;">
-            <div style="font-size: 48px; font-weight: bold; color: {color};">
-                {note}{octave}
-            </div>
+            <div style="font-size: 48px; font-weight: bold; color: {color};">{note}{octave}</div>
             <div style="margin-top: 10px; font-size: 16px; color: #aaa;">
                 {f0:.2f} Гц | <span style="color: {color}; font-weight: bold;">{c:+.2f} центов</span> | {status}
             </div>
             <div style="margin-top: 20px; height: 10px; background: #2a2a2a; border-radius: 5px; position: relative; border: 1px solid #444;">
                 <div style="position: absolute; left: 50%; top: -5px; width: 2px; height: 20px; background: #fff; z-index: 2;"></div>
-                <div style="position: absolute; left: {bar_pos}%; top: -7px; width: 14px; height: 24px; background: {color}; border-radius: 3px; transform: translateX(-50%); box-shadow: 0 0 8px {color}; transition: left 0.1s ease-out;"></div>
+                <div style="position: absolute; left: {bar_pos}%; top: -7px; width: 14px; height: 24px; background: {color}; border-radius: 3px; transform: translateX(-50%); box-shadow: 0 0 8px {color};"></div>
             </div>
             <div style="display: flex; justify-content: space-between; margin-top: 8px; font-size: 11px; color: #666;">
                 <span>-50¢</span><span>0</span><span>+50¢</span>
@@ -193,20 +216,14 @@ def render_tuner(rec):
         """, unsafe_allow_html=True)
         return True
     else:
-        # Показываем отладочную информацию
-        debug_info = f"RMS: {rms:.4f} | Conf: {conf:.2f}"
+        debug_info = f"RMS: {rms:.4f} | Conf: {conf:.2f} | SR: {rec.sr} | буфер: {rec.filled_seconds():.1f} с"
         if f0:
             debug_info += f" | F0: {f0:.1f} Гц"
-        
         st.markdown(f"""
         <div style="background: #1e1e1e; padding: 20px; border-radius: 10px; text-align: center;">
             <div style="font-size: 48px; font-weight: bold; color: #666;">—</div>
-            <div style="margin-top: 10px; font-size: 16px; color: #888;">
-                Сыграйте ноту для отображения
-            </div>
-            <div style="margin-top: 10px; font-size: 12px; color: #555;">
-                {debug_info}
-            </div>
+            <div style="margin-top: 10px; font-size: 16px; color: #888;">Сыграйте ноту для отображения</div>
+            <div style="margin-top: 10px; font-size: 12px; color: #555;">{debug_info}</div>
         </div>
         """, unsafe_allow_html=True)
         return False
@@ -218,9 +235,7 @@ def get_string_status(string_num, results):
         return None
     if 'intonation' not in res or len(res['buzz']) < 4:
         return 'partial'
-    has_error = False
-    if abs(res.get('intonation', 0)) > 3:
-        has_error = True
+    has_error = abs(res.get('intonation', 0)) > 3
     for f in [1, 5, 7, 9]:
         if res['buzz'].get(f, {}).get('is_buzz'):
             has_error = True
@@ -233,21 +248,11 @@ def pick_string(current, results):
     for i in range(6):
         s = 6 - i
         status = get_string_status(s, results)
-        
-        # Streamlit поддерживает только primary/secondary/tertiary
-        btn_type = "secondary"
-        if s == current:
-            btn_type = "primary"
-        
-        # Добавляем эмодзи для визуальной индикации статуса
+        btn_type = "primary" if s == current else "secondary"
         label = f"Струна {s}"
-        if status == 'success':
-            label = f"✅ Струна {s}"
-        elif status == 'error':
-            label = f"⚠️ Струна {s}"
-        elif status == 'partial':
-            label = f"🔧 Струна {s}"
-        
+        if status == 'success': label = f"✅ Струна {s}"
+        elif status == 'error': label = f"⚠️ Струна {s}"
+        elif status == 'partial': label = f"🔧 Струна {s}"
         if cols[i].button(label, key=f"str_{s}", type=btn_type, use_container_width=True):
             return s
     return current
@@ -305,8 +310,10 @@ for pos, (i, d) in enumerate(input_devs):
     try:
         h = sd.query_hostapi_info(d['hostapi'])['name']
         if 'WASAPI' in h and 'BEHRINGER' in d['name'].upper():
-            default_pos = pos; break
-    except Exception: pass
+            default_pos = pos
+            break
+    except Exception:
+        pass
 
 sel = st.sidebar.selectbox("Микрофон/вход", range(len(input_devs)),
                            index=default_pos, format_func=dev_label)
@@ -314,39 +321,46 @@ device_index = input_devs[sel][0]
 channel = st.sidebar.radio("Канал", [0, 1], index=0,
                            help="0 = INSTRUMENT/Line 1, 1 = Line 2")
 st.sidebar.caption(f"Устройство №{device_index}: {input_devs[sel][1]['name']}")
-
-rec = MicRecorder(device=device_index, channel=channel)
-rec.start()
+if st.sidebar.button("♻️ Перезапустить аудио"):
+    st.cache_resource.clear()
+    st.rerun()
 
 try:
-    # ТЮНЕР - всегда виден
+    rec = get_recorder(device_index)
+    rec.channel = channel
+except Exception as e:
+    st.error(f"Не удалось открыть устройство: {e}")
+    st.stop()
+
+# даём буферу наполниться
+if rec.filled_seconds() < 0.8:
+    time.sleep(0.9)
+
+try:
     st.markdown("### 🎵 Онлайн-тюнер")
     if st.session_state.step == 0:
         st.caption("Сыграйте любую ноту — тюнер покажет частоту и отклонение. Настройте гитару вручную, затем нажмите кнопку ниже.")
     else:
-        st.caption("Тюнер работает в фоне. Настройте гитару при необходимости.")
-    
-    tuner_active = render_tuner(rec)
-    
-    # ШАГ 0: Только тюнер + кнопка
+        st.caption("Тюнер показывает последнее значение. Настройте гитару при необходимости.")
+
+    render_tuner(rec)
+
+    # ШАГ 0
     if st.session_state.step == 0:
         st.markdown("---")
         st.markdown("**Готовы приступить к диагностике?**")
         st.caption("Убедитесь, что гитара настроена. Мастер проведёт вас через проверку мензуры и дребезга.")
-        
+
         if st.button("🎸 Приступить к диагностике", type="primary"):
             st.session_state.step = 1
             st.rerun()
-        
-        # Автообновление тюнера на шаге 0
-        time.sleep(2)
+
+        time.sleep(0.3)
         st.rerun()
 
-    # ШАГ 1-4: Тюнер + кнопки струн + мастер
     else:
         st.markdown("---")
-        
-        # Выбор струны (всегда виден на шагах 1-4)
+
         string_num = pick_string(st.session_state.string, st.session_state.results)
         if string_num != st.session_state.string:
             st.session_state.string = string_num
@@ -355,11 +369,11 @@ try:
             if string_num not in st.session_state.results:
                 st.session_state.results[string_num] = {'buzz': {}}
             st.rerun()
-        
+
         target = STANDARD_TUNING[string_num]
         res = st.session_state.results.setdefault(string_num, {'buzz': {}})
-        
-        # ШАГ 1: Открытая струна
+
+        # ШАГ 1
         if st.session_state.step == 1:
             if 'open' not in res:
                 r = live_capture(rec, f"Шаг 1. Сыграйте открытую {string_num}-ю струну", target)
@@ -367,7 +381,7 @@ try:
                     res['open'] = r
                     st.rerun()
             else:
-                st.success(f"✅ Открытая струна: {res['open']['f0']:.2f} Гц ({res['open'].get('cents', 0):+.1f} центов)")
+                st.success(f"✅ Открытая струна: {res['open']['f0']:.2f} Гц ({res['open'].get('cents', 0) or 0:+.1f} центов)")
                 st.markdown("---")
                 st.markdown("**Готовы перейти к Шагу 2 (диагностика мензуры)?**")
                 st.caption("На этом шаге мы сравним флажолет на 12 ладу с зажатой нотой на 12 ладу.")
@@ -375,13 +389,13 @@ try:
                     st.session_state.step = 2
                     st.rerun()
 
-        # ШАГ 2: Мензура
+        # ШАГ 2
         elif st.session_state.step == 2:
             open_f0 = res['open']['f0']
             open_cents = res['open'].get('cents', 0) or 0
             st.markdown(f"📏 Референс открытой: **{open_f0:.2f} Гц** ({open_cents:+.1f} центов)")
             st.caption("Абсолютная точность не важна — сравниваем флажолет и зажатую ноту между собой.")
-            
+
             if 'harm' not in res:
                 r1 = live_capture(rec, "Шаг 2а. Флажолет на 12 ладу", open_f0 * 2, is_harmonic=True)
                 if r1:
@@ -396,11 +410,10 @@ try:
                     st.session_state.step = 2.5
                     st.rerun()
 
-        # ШАГ 2.5: Зажатая нота
+        # ШАГ 2.5
         elif st.session_state.step == 2.5:
             open_f0 = res['open']['f0']
-            
-            # Если флажолет был удалён (перемерить) — начинаем с него заново
+
             if 'harm' not in res:
                 r1 = live_capture(rec, "Шаг 2а. Флажолет на 12 ладу", open_f0 * 2, is_harmonic=True)
                 if r1:
@@ -408,7 +421,7 @@ try:
                     st.rerun()
             else:
                 st.markdown(f"✅ Флажолет: **{res['harm']['f0']:.2f} Гц**")
-                
+
                 if 'fretted' not in res:
                     r2 = live_capture(rec, "Шаг 2б. Зажатая нота на 12 ладу", open_f0 * 2)
                     if r2:
@@ -421,43 +434,40 @@ try:
                     col1.metric("Флажолет F0", f"{res['harm']['f0']:.2f} Гц")
                     col2.metric("Зажатая F0", f"{res['fretted']['f0']:.2f} Гц")
                     col3.metric("Дельта мензуры", f"{res['intonation']:+.1f} центов")
-                    
+
                     if abs(res['intonation']) < 0.5:
-                        st.warning("⚠️ Дельта = 0.0 центов. Это подозрительно — возможно, обе ноты записались одинаково. Попробуйте перемерить.")
+                        st.warning("⚠️ Дельта ≈ 0 центов. Это подозрительно — возможно, обе ноты записались одинаково. Попробуйте перемерить.")
                         if st.button("🔄 Перемерить Шаг 2"):
-                            if 'harm' in res: del res['harm']
-                            if 'fretted' in res: del res['fretted']
-                            if 'intonation' in res: del res['intonation']
+                            for k in ('harm', 'fretted', 'intonation'):
+                                res.pop(k, None)
                             st.rerun()
                     else:
                         st.success("✅ Шаг 2 завершён.")
-                    
+
                     st.markdown("---")
                     st.markdown("**Готовы перейти к Шагу 3 (диагностика дребезга)?**")
                     st.caption("На этом шаге мы проверим лады 1, 5, 7, 9 на наличие дребезга.")
                     if st.button("✅ Да, перейти к Шагу 3 →", type="primary"):
                         st.session_state.step = 3
                         st.rerun()
-        # ШАГ 3: Дребезг
+
+        # ШАГ 3
         elif st.session_state.step == 3:
             st.markdown("### Шаг 3. Диагностика дребезга")
             st.caption("Играйте с умеренным нажатием. Нажимайте кнопку только после того, как готовы сыграть.")
-            
-            if 'current_fret' not in st.session_state:
-                st.session_state.current_fret = None
-            
+
             frets_sequence = [1, 5, 7, 9]
-            
+
             if st.session_state.current_fret is None:
                 st.markdown("---")
                 st.markdown("**Готовы начать диагностику дребезга?**")
-                st.caption("Начнём с лада 1. Сыграйте по открытой струне, зажав её на 1 ладу.")
+                st.caption("Начнём с лада 1. Зажмите струну на 1 ладу и сыграйте.")
                 if st.button("▶️ Начать с лада 1", type="primary"):
                     st.session_state.current_fret = 1
                     st.rerun()
             else:
                 current_fret = st.session_state.current_fret
-                
+
                 if current_fret not in res['buzz']:
                     b = capture_fret_buzz(rec, current_fret)
                     if b:
@@ -468,19 +478,15 @@ try:
                     status = "🔴 ДРЕБЕЗГ" if b.get('is_buzz') else "🟢 Чисто"
                     st.markdown(f"**Лад {current_fret}:** {status}")
                     st.caption(f"Центроид: {b.get('centroid', 0):.0f} | Bend: {b.get('bend', 0):+.1f} ц")
-                    
+
                     if st.button(f"🔄 Перемерить лад {current_fret}"):
                         del res['buzz'][current_fret]
                         st.rerun()
-                    
+
                     st.markdown("---")
-                    
-                    next_fret = None
-                    for f in frets_sequence:
-                        if f not in res['buzz']:
-                            next_fret = f
-                            break
-                    
+
+                    next_fret = next((f for f in frets_sequence if f not in res['buzz']), None)
+
                     if next_fret is not None:
                         st.markdown(f"**Готовы перейти к ладу {next_fret}?**")
                         st.caption("Подготовьте руку, зажмите струну на нужном ладу, затем нажмите кнопку.")
@@ -488,16 +494,16 @@ try:
                             st.session_state.current_fret = next_fret
                             st.rerun()
                     else:
-                        st.success("✅ Все лада измерены!")
+                        st.success("✅ Все лады измерены!")
                         if st.button("📊 Показать итоги", type="primary"):
                             st.session_state.step = 4
                             st.session_state.current_fret = None
                             st.rerun()
 
-        # ШАГ 4: Итоги
+        # ШАГ 4
         elif st.session_state.step == 4:
             st.markdown("### Итоги диагностики")
-            
+
             if 'open' in res:
                 open_c = res['open'].get('cents', 0) or 0
                 st.metric("Строй", f"{open_c:+.1f} центов")
@@ -513,16 +519,17 @@ try:
                 st.markdown("### Рекомендации")
                 for r in recommendations(res):
                     st.info(r)
-            
+
             if st.button("🔄 Начать заново для этой струны"):
-                del st.session_state.results[string_num]
+                st.session_state.results.pop(string_num, None)
                 st.session_state.step = 1
                 st.session_state.current_fret = None
                 st.rerun()
 
 except Exception as e:
-    st.error(f"Ошибка захвата: {e}")
+    # st.rerun() использует исключение внутри — пропускаем его дальше
+    if type(e).__name__ in ("RerunException", "StopException"):
+        raise
     import traceback
+    st.error(f"Ошибка захвата: {e}")
     st.code(traceback.format_exc())
-finally:
-    rec.stop()
