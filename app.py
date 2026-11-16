@@ -263,7 +263,7 @@ try:
         open_cents = res['open'].get('cents', 0) or 0
         st.markdown(f"📏 Референс открытой: **{open_f0:.2f} Гц** ({open_cents:+.1f} центов)")
         st.caption("Абсолютная точность не важна — сравниваем флажолет и зажатую ноту между собой.")
-        
+
         # 2а: Флажолет
         if 'harm' not in res:
             r1 = live_capture(rec, "Шаг 2а. Флажолет на 12 ладу", open_f0 * 2, is_harmonic=True)
@@ -283,7 +283,7 @@ try:
     elif st.session_state.step == 2.5:
         open_f0 = res['open']['f0']
         st.markdown(f"✅ Флажолет: **{res['harm']['f0']:.2f} Гц**")
-        
+
         if 'fretted' not in res:
             r2 = live_capture(rec, "Шаг 2б. Зажатая нота на 12 ладу", open_f0 * 2)
             if r2:
@@ -297,7 +297,7 @@ try:
             col1.metric("Флажолет F0", f"{res['harm']['f0']:.2f} Гц")
             col2.metric("Зажатая F0", f"{res['fretted']['f0']:.2f} Гц")
             col3.metric("Дельта мензуры", f"{res['intonation']:+.1f} центов")
-            
+
             # Проверка на подозрительные данные
             if abs(res['intonation']) < 0.5:
                 st.warning("⚠️ Дельта = 0.0 центов. Это подозрительно — возможно, обе ноты записались одинаково. Попробуйте перемерить.")
@@ -308,7 +308,7 @@ try:
                     st.rerun()
             else:
                 st.success("✅ Шаг 2 завершён.")
-            
+
             st.markdown("---")
             st.markdown("**Готовы перейти к Шагу 3 (диагностика дребезга)?**")
             st.caption("На этом шаге мы проверим лады 1, 5, 7, 9 на наличие дребезга.")
@@ -316,28 +316,78 @@ try:
                 st.session_state.step = 3
                 st.rerun()
 
-    # ШАГ 3: Дребезг
+    # ШАГ 3: Дребезг (с явным управлением ладами)
     elif st.session_state.step == 3:
         st.markdown("### Шаг 3. Диагностика дребезга")
-        st.markdown("Играйте по очереди на ладах **1, 5, 7, 9** с умеренным нажатием.")
-        
-        for f in [1, 5, 7, 9]:
-            if f not in res['buzz']:
-                b = capture_fret_buzz(rec, f)
+        st.caption("Играйте с умеренным нажатием. Нажимайте кнопку только после того, как готовы сыграть.")
+
+        # Инициализация текущего лада
+        if 'current_fret' not in st.session_state:
+            st.session_state.current_fret = None
+
+        frets_sequence = [1, 5, 7, 9]
+
+        # Определяем, какой лад следующий
+        if st.session_state.current_fret is None:
+            # Первый запуск Шага 3 — предлагаем начать
+            st.markdown("---")
+            st.markdown("**Готовы начать диагностику дребезга?**")
+            st.caption("Начнём с лада 1. Сыграйте по открытой струне, зажав её на 1 ладу.")
+            if st.button("▶️ Начать с лада 1", type="primary"):
+                st.session_state.current_fret = 1
+                st.rerun()
+        else:
+            current_fret = st.session_state.current_fret
+
+            # Если этот лад ещё не измерен — запускаем захват
+            if current_fret not in res['buzz']:
+                b = capture_fret_buzz(rec, current_fret)
                 if b:
-                    res['buzz'][f] = b
+                    res['buzz'][current_fret] = b
                     st.rerun()
-        
-        # Все 4 лада измерены
-        st.session_state.step = 4
-        st.rerun()
+            else:
+                # Показываем результат текущего лада
+                b = res['buzz'][current_fret]
+                status = "🔴 ДРЕБЕЗГ" if b.get('is_buzz') else "🟢 Чисто"
+                st.markdown(f"**Лад {current_fret}:** {status}")
+                st.caption(f"Центроид: {b.get('centroid', 0):.0f} | Bend: {b.get('bend', 0):+.1f} ц")
+
+                # Кнопка перемерить
+                if st.button(f"🔄 Перемерить лад {current_fret}"):
+                    del res['buzz'][current_fret]
+                    st.rerun()
+
+                st.markdown("---")
+
+                # Ищем следующий неизмеренный лад
+                next_fret = None
+                for f in frets_sequence:
+                    if f not in res['buzz']:
+                        next_fret = f
+                        break
+
+                if next_fret is not None:
+                    st.markdown(f"**Готовы перейти к ладу {next_fret}?**")
+                    st.caption("Подготовьте руку, зажмите струну на нужном ладу, затем нажмите кнопку.")
+                    if st.button(f"▶️ Перейти к ладу {next_fret}", type="primary"):
+                        st.session_state.current_fret = next_fret
+                        st.rerun()
+                else:
+                    # Все лада измерены
+                    st.success("✅ Все лада измерены!")
+                    if st.button("📊 Показать итоги", type="primary"):
+                        st.session_state.step = 4
+                        st.session_state.current_fret = None
+                        st.rerun()
 
 except Exception as e:
-    st.error(f"Ошибка захвата: {e}")
-    import traceback
-    st.code(traceback.format_exc())
+    st.error(f"❌ Ошибка при выполнении диагностики: {e}")
+    st.exception(e)
 finally:
-    rec.stop()
+    try:
+        rec.stop()
+    except Exception:
+        pass
 
 # ============ ИТОГИ ============
 if 'open' in res:
