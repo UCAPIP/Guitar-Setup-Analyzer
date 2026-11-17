@@ -15,13 +15,15 @@ except ImportError:
 SR, BLOCK, BUFFER_SEC = 44100, 2048, 4
 RMS_QUIET, RMS_LOUD = 0.003, 0.30
 RMS_HARM_QUIET = 0.001
-TUNE_TOL = 5.0          # ТЗ: блок шага 2 при отклонении > 5 центов
-INTON_TOL = 3.0         # ТЗ: порог мензуры, центы
-JUMP_THR, HF_THR, ZJUMP_THR = 1.5, 0.5, 1.5   # базовые пороги дребезга (до масштаба по калибру)
+TUNE_TOL = 5.0
+INTON_TOL = 3.0
+# Пороги дребезга (до масштаба по калибру и слайдера чувствительности)
+NF_REL, NF_ABS_MIN, HF_REL = 1.6, 0.08, 2.5     # относительно эталона (открытая струна)
+NF_ABS, HF_ABS = 0.35, 0.05                      # запасной вариант без эталона
+SENS = 1.0                                       # переопределяется слайдером
 STANDARD_TUNING = {6: 82.41, 5: 110.00, 4: 146.83, 3: 196.00, 2: 246.94, 1: 329.63}
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
-# Наборы калибров (дюймы), струны 1..6
 GAUGE_SETS = {
     "009–042 (Extra Light)":  [.009, .011, .016, .024, .032, .042],
     "010–046 (Regular Light)": [.010, .013, .017, .026, .036, .046],
@@ -43,44 +45,51 @@ SCALES = {
     '24" (610 мм) короткая': 610.0,
     '27" (686 мм) баритон': 686.0,
 }
+FRETS_SEQ = [0, 1, 5, 7, 9]      # 0 = эталон (чистая открытая струна)
+TEST_FRETS = (1, 5, 7, 9)
 
-# ============ ПРОФИЛЬ СТРУНЫ (калибр -> пороги) ============
+# ============ ПРОФИЛЬ СТРУНЫ ============
 def is_wound(s, gauge):
     return s >= 4 or (s == 3 and gauge >= 0.020)
 
 def string_profile(s, gauge, f_target, scale_mm):
-    """Эвристическая модель: натяжение, жёсткость, масштаб порогов. Требует калибровки на реальных записях."""
     L = scale_mm / 1000.0
     D = gauge * 0.0254
     rho = 7850.0
     wound = is_wound(s, gauge)
     if wound:
-        mu = 0.66 * rho * math.pi * D ** 2 / 4      # обмотка легче сплошной стали
+        mu = 0.66 * rho * math.pi * D ** 2 / 4
         d_core = 0.43 * D
     else:
         mu = rho * math.pi * D ** 2 / 4
         d_core = D
-    T = mu * (2 * L * f_target) ** 2                 # Н
-    B = math.pi ** 3 * 2.0e11 * d_core ** 4 / (64 * T * L ** 2)   # коэф. инharmоничности
-    inh_cents = 1200 * math.log2(math.sqrt((1 + 4 * B) / (1 + B)))  # 2-я гармоника vs 2*F0 (справочно)
-    stretch = float(np.clip(60.0 / T, 0.8, 1.5))     # тонкие/слабонатянутые тянутся сильнее
+    T = mu * (2 * L * f_target) ** 2
+    B = math.pi ** 3 * 2.0e11 * d_core ** 4 / (64 * T * L ** 2)
+    stretch = float(np.clip(60.0 / T, 0.8, 1.5))
     ref = REF_GAUGES[s]
     buzz_scale = (1.3 if wound else 1.0) * float(np.clip(1 - 10 * (gauge - ref), 0.85, 1.15))
-    return {
-        'gauge': gauge, 'wound': wound, 'T': T, 'B': B, 'inh_cents': inh_cents,
-        'sharp_thr': 10.0 * stretch, 'buzz_scale': buzz_scale, 'scale_mm': scale_mm,
-    }
+    return {'gauge': gauge, 'wound': wound, 'T': T, 'B': B,
+            'sharp_thr': 10.0 * stretch, 'buzz_scale': buzz_scale, 'scale_mm': scale_mm}
 
-def evaluate_buzz(m, prof):
-    if not m or m.get('jump') is None:
-        return False
-    k = prof['buzz_scale']
-    votes = int(m['jump'] > JUMP_THR * k) + int(m['hf'] > HF_THR * k) + int(m['zjump'] > ZJUMP_THR * k)
-    return votes >= 2
+def evaluate_buzz(m, prof, base=None, sens=1.0):
+    """True = дребезг, False = чисто, None = нет измерения."""
+    if not m or m.get('nf') is None:
+        return None
+    k = prof['buzz_scale'] / max(sens, 0.1)
+    if base and base.get('nf') is not None:
+        nf_rel = m['nf'] / max(base['nf'], 0.02)
+        hf_rel = m['hf'] / max(base['hf'], 1e-4)
+        return bool((nf_rel > NF_REL * k and m['nf'] > NF_ABS_MIN) or hf_rel > HF_REL * k)
+    return bool(m['nf'] > NF_ABS * k or m['hf'] > HF_ABS * k)
+
+def buzz_state(res, f, prof):
+    return evaluate_buzz(res['buzz'].get(f), prof, res['buzz'].get(0), SENS)
 
 def saddle_mm(delta_cents, scale_mm):
-    """На сколько мм сместить седло, чтобы убрать дельту (длина зажатой части на 12 ладу = L/2)."""
     return (scale_mm / 2) * (2 ** (abs(delta_cents) / 1200) - 1)
+
+def fret_name(f):
+    return "Эталон (открытая струна)" if f == 0 else f"Лад {f}"
 
 # ============ АУДИО-ДВИЖОК ============
 class MicRecorder:
@@ -132,10 +141,9 @@ def highpass(y, sr, cutoff=70):
     return lfilter(b, a, y)
 
 def get_pitch(y, sr, fmin=65, fmax=1200, frame_length=4096):
-    """y — уже вырезанный кусок сигнала. Возвращает (F0, confidence)."""
     if len(y) < frame_length + 1024:
         return None, 0.0
-    y = highpass(y, sr)[int(sr * 0.03):]   # отбрасываем переходный процесс фильтра
+    y = highpass(y, sr)[int(sr * 0.03):]
     if len(y) < frame_length + 512 or np.max(np.abs(y)) < 1e-5:
         return None, 0.0
     try:
@@ -160,16 +168,40 @@ def freq_to_note(f):
     mr = int(round(midi))
     return NOTE_NAMES[mr % 12], (mr // 12) - 1, 440.0 * 2 ** ((mr - 69) / 12)
 
-def find_onset(y, sr):
+def find_onset(y, sr, lo, hi):
     k = max(1, int(sr * 0.005))
     env = np.convolve(np.abs(y), np.ones(k) / k, mode='same')
-    if env.max() < 1e-5:
+    lo, hi = max(0, lo), min(len(y), hi)
+    if hi - lo < k or env[lo:hi].max() < 1e-5:
         return None
-    idx = np.where(env > 0.3 * env.max())[0]
-    return int(idx[0]) if len(idx) else None
+    idx = np.where(env[lo:hi] > 0.3 * env[lo:hi].max())[0]
+    return lo + int(idx[0]) if len(idx) else None
+
+def spectral_stats(seg, sr, f0, B):
+    """nf — доля энергии вне гармоник F0 (шум, субгармоники, дребезг); hf — энергия 2–8 кГц к энергии F0."""
+    n = 4096
+    if len(seg) < n:
+        return None, None
+    win = np.hanning(n)
+    P = np.mean([np.abs(np.fft.rfft(seg[i:i + n] * win)) ** 2
+                 for i in range(0, len(seg) - n + 1, n // 2)], axis=0)
+    freqs = np.fft.rfftfreq(n, 1 / sr)
+    fmax = min(5000.0, 30 * f0)
+    band = (freqs >= 0.5 * f0) & (freqs <= fmax)
+    mask = np.zeros(len(freqs), bool)
+    k = 1
+    while True:
+        fk = k * f0 * math.sqrt((1 + B * k * k) / (1 + B))   # гармоники с учётом жёсткости струны
+        if fk > fmax:
+            break
+        mask |= np.abs(freqs - fk) <= max(2 * sr / n, 0.01 * fk)
+        k += 1
+    nf = float(P[band & ~mask].sum() / (P[band].sum() + 1e-12))
+    fund = P[(freqs > f0 * 0.9) & (freqs < f0 * 1.1)].sum()
+    hf = float(P[(freqs > 2000) & (freqs < 8000)].sum() / (fund + 1e-12))
+    return nf, hf
 
 def frame_feats(y, sr, f0, n=2048):
-    """Признаки по кадрам (hop 10 мс): центроид, ZCR, HF/F0, энергия F0."""
     hop = int(sr * 0.01)
     win = np.hanning(n)
     freqs = np.fft.rfftfreq(n, 1 / sr)
@@ -180,33 +212,25 @@ def frame_feats(y, sr, f0, n=2048):
         tot = S.sum() + 1e-9
         cent = float((freqs * S).sum() / tot)
         zcr = float(np.mean(np.abs(np.diff(np.sign(fr))) > 0))
-        hf = float(S[freqs > 2000].sum())
-        fe = float(S[(freqs > f0 * 0.85) & (freqs < f0 * 1.15)].sum()) if f0 else tot
-        out.append((cent, zcr, hf / (fe + 1e-9), fe))
+        out.append((cent, zcr))
     return np.array(out)
 
-def buzz_metrics(y, f0, sr):
-    """Сравнивает атаку (первые ~90 мс после onset) с сустейном. Возвращает dict метрик."""
-    on = find_onset(y, sr)
-    if on is None:
+def buzz_metrics(w, sr, on, f0, B):
+    wh = highpass(w, sr)
+    sus = wh[on + int(sr * 0.04): on + int(sr * 0.64)]
+    atk = wh[on: on + int(sr * 0.14)]
+    nf, hf = spectral_stats(sus, sr, f0, B)
+    if nf is None:
         return None
-    atk_seg = y[on:on + int(sr * 0.14)]
-    sus_seg = y[on + int(sr * 0.25):]
-    if len(atk_seg) < 2048 + 441 or len(sus_seg) < 2048 + 441:
-        return None
-    A = frame_feats(atk_seg, sr, f0)[:5]
-    S = frame_feats(sus_seg, sr, f0)
-    if len(A) == 0 or len(S) == 0:
-        return None
-    return {
-        'jump': float(A[:, 0].mean() / (S[:, 0].mean() + 1e-9)),
-        'zjump': float(A[:, 1].mean() / (S[:, 1].mean() + 1e-9)),
-        'hf': float(A[:, 2].mean()),
-        'centroid': float(A[:, 0].mean()),
-        'f0_drop': float(A[:, 3].mean() / (S[:, 3].mean() + 1e-9)),
-        'onset': on,
-        'rms_atk': float(np.sqrt(np.mean(atk_seg[:int(sr * 0.1)] ** 2))),
-    }
+    jump = zjump = None
+    if len(atk) >= 2048 + 441 and len(sus) >= 2048 + 441:
+        A = frame_feats(atk, sr, f0)[:5]
+        S = frame_feats(sus, sr, f0)
+        if len(A) and len(S):
+            jump = float(A[:, 0].mean() / (S[:, 0].mean() + 1e-9))
+            zjump = float(A[:, 1].mean() / (S[:, 1].mean() + 1e-9))
+    return {'nf': nf, 'hf': hf, 'jump': jump, 'zjump': zjump,
+            'rms_atk': float(np.sqrt(np.mean(w[on:on + int(sr * 0.1)] ** 2)))}
 
 # ============ LIVE-ЗАХВАТ ============
 def live_capture(rec, title, f_target=None, timeout=25, is_harmonic=False, conf_min=0.4):
@@ -228,7 +252,6 @@ def live_capture(rec, title, f_target=None, timeout=25, is_harmonic=False, conf_
         elif rms < quiet: msg += f"\n\n🔇 Не слышно. Играйте громче (порог: {quiet:.4f})."
         elif f0 is None: msg += "\n\n🎵 Ищу питч... тяните ноту длиннее."
         ph.markdown(msg)
-
         if f0 and conf > conf_min and rms > quiet:
             stable.append(c if c is not None else 0)
             if len(stable) >= 6 and np.std(stable[-6:]) < 5:
@@ -238,46 +261,54 @@ def live_capture(rec, title, f_target=None, timeout=25, is_harmonic=False, conf_
     ph.markdown("⏱️ Таймаут. Сыграйте ровнее и попробуйте ещё раз.")
     return None
 
-def capture_fret_buzz(rec, fret, open_f0, prof, timeout=25):
-    st.caption(f"Лад {fret}: зажмите струну и ударьте умеренно")
+def capture_fret_buzz(rec, fret, open_f0, prof, base, timeout=30):
+    """Возвращает dict с метриками или None, если атака не поймана (НЕ 'чисто')."""
+    st.caption(f"{fret_name(fret)}: " + ("сыграйте чисто открытую струну"
+                                         if fret == 0 else "зажмите струну на ладу и ударьте умеренно"))
     ph = st.empty()
     bar = st.empty()
     sr = rec.sr
     f_exp = open_f0 * 2 ** (fret / 12)
-    prev, t0 = 0.0, time.time()
+    hist = deque(maxlen=10)
+    t0 = time.time()
     while time.time() - t0 < timeout:
-        rms = float(np.sqrt(np.mean(rec.window(0.1) ** 2)))
-        ph.markdown(f"Лад {fret}: ждём атаку... RMS {rms:.4f}")
-        if rms > RMS_QUIET and prev < RMS_QUIET and (time.time() - t0) > 0.5:
-            time.sleep(0.9)
-            w = rec.window(1.3)
-            m = buzz_metrics(w, f_exp, sr)
-            if m is None:
-                ph.markdown("⚠️ Не удалось выделить атаку. Ударьте ещё раз.")
-                prev = 0.0
-                time.sleep(1.0)
+        rms = float(np.sqrt(np.mean(rec.window(0.05) ** 2)))
+        ph.markdown(f"{fret_name(fret)}: ждём атаку... RMS {rms:.4f}")
+        ref = float(np.median(hist)) if len(hist) >= 5 else None
+        # триггер по росту громкости (работает, даже если предыдущая нота ещё звучит)
+        if ref is not None and rms > RMS_QUIET and rms > 3 * max(ref, 1e-6):
+            ph.markdown(f"{fret_name(fret)}: атака поймана, анализирую...")
+            time.sleep(0.8)
+            w = rec.window(1.1)
+            exp = len(w) - int(sr * 0.88)
+            on = find_onset(w, sr, exp - int(sr * 0.12), exp + int(sr * 0.2))
+            if on is None or len(w) - on < int(sr * 0.7):
+                hist.clear()
+                time.sleep(0.5)
                 continue
-            on = m['onset']
-            f_sus, _ = get_pitch(w[on + int(sr * 0.25):on + int(sr * 0.75)], sr,
+            f_sus, _ = get_pitch(w[on + int(sr * 0.1): on + int(sr * 0.6)], sr,
                                  fmin=f_exp * 0.8, fmax=f_exp * 1.25)
-            f_atk, _ = get_pitch(w[on:on + int(sr * 0.14)], sr, fmin=f_exp * 0.8,
+            f_atk, _ = get_pitch(w[on: on + int(sr * 0.14)], sr, fmin=f_exp * 0.8,
                                  fmax=f_exp * 1.25, frame_length=2048)
+            m = buzz_metrics(w, sr, on, f_sus or f_exp, prof['B'])
+            if m is None:
+                hist.clear()
+                continue
             m['f0'] = f_sus
-            m['sharp'] = cents(f_sus, f_exp) if f_sus else 0.0      # завышение vs ожидаемая нота лада
+            m['sharp'] = cents(f_sus, f_exp) if f_sus else 0.0
             m['bend'] = cents(f_atk, f_sus) if (f_atk and f_sus) else 0.0
             m['fret'] = fret
             m['too_loud'] = m['rms_atk'] > RMS_LOUD
-            buzz = evaluate_buzz(m, prof)
+            state = evaluate_buzz(m, prof, None if fret == 0 else base, SENS)
             bar.progress(min(1.0, m['rms_atk'] / RMS_LOUD), text=f"Сила атаки: {m['rms_atk']:.3f}")
+            label = "📏 эталон записан" if fret == 0 else ("🔴 Дребезг" if state else "🟢 Чисто")
             warn = "  \n⚠️ Слишком сильная атака — результат может быть недостоверным." if m['too_loud'] else ""
-            ph.markdown(f"Лад {fret}: {'🔴 Дребезг' if buzz else '🟢 Чисто'} "
-                        f"(скачок центроида ×{m['jump']:.2f}, HF {m['hf']:.2f}, "
-                        f"завышение {m['sharp']:+.1f} ц){warn}")
+            ph.markdown(f"{fret_name(fret)}: {label} (nf {m['nf']:.3f}, hf {m['hf']:.4f}){warn}")
             return m
-        prev = rms
+        hist.append(rms)
         time.sleep(0.05)
-    return {'fret': fret, 'jump': None, 'zjump': None, 'hf': None, 'f0': None,
-            'sharp': 0.0, 'bend': 0.0, 'centroid': 0.0, 'too_loud': False}
+    ph.markdown("⏱️ Атака не зафиксирована (таймаут).")
+    return None
 
 # ============ ТЮНЕР ============
 def render_tuner(rec, conf_min=0.3):
@@ -285,7 +316,6 @@ def render_tuner(rec, conf_min=0.3):
     w = rec.window(0.8)
     rms = float(np.sqrt(np.mean(w[-int(sr * 0.3):] ** 2)))
     f0, conf = get_pitch(w[-int(sr * 0.5):], sr, fmin=65, fmax=1200)
-
     if f0 and conf > conf_min and rms > 0.001:
         note, octave, center = freq_to_note(f0)
         c = cents(f0, center)
@@ -325,11 +355,11 @@ def get_string_status(s, results, profiles):
     res = results.get(s, {'buzz': {}})
     if 'open' not in res:
         return None
-    if 'intonation' not in res or len(res['buzz']) < 4:
+    if 'intonation' not in res or not all(f in res['buzz'] for f in FRETS_SEQ):
         return 'partial'
     err = abs(res['intonation']) > INTON_TOL or abs(res['open'].get('cents') or 0) > TUNE_TOL
-    for f in (1, 5, 7, 9):
-        if evaluate_buzz(res['buzz'].get(f), profiles[s]):
+    for f in TEST_FRETS:
+        if buzz_state(res, f, profiles[s]):
             err = True
             break
     return 'error' if err else 'success'
@@ -359,8 +389,7 @@ def recommendations(res, prof):
             out.append(f"⚠️ Мензура длинная ({d:+.1f} ц). Сдвиньте седло вперёд (к грифу) ≈ на {mm:.1f} мм.")
         else:
             out.append("✅ Мензура в норме.")
-    buzz = res['buzz']
-    flags = {f: evaluate_buzz(buzz.get(f), prof) for f in (1, 5, 7, 9)}
+    flags = {f: bool(buzz_state(res, f, prof)) for f in TEST_FRETS}
     low = [f for f in (1, 5) if flags[f]]
     mid = [f for f in (7, 9) if flags[f]]
     if len(low) == 2 and len(mid) == 2:
@@ -369,11 +398,11 @@ def recommendations(res, prof):
         out.append("⚠️ Дребезг у головы грифа: слегка ослабьте анкер (добавить прогиб) или проверьте высоту верхнего порожка.")
     elif mid and not low:
         out.append("⚠️ Дребезг в середине: проверьте прогиб (возможно, подтянуть анкер) или поднимите седла.")
-    sharp = [v['sharp'] for v in buzz.values() if v.get('sharp') is not None and v.get('f0')]
+    sharp = [v['sharp'] for f, v in res['buzz'].items() if f > 0 and v.get('f0')]
     if len(sharp) >= 3 and sum(1 for x in sharp if x > prof['sharp_thr']) >= 3:
         out.append(f"⚠️ Завышение питча при нажатии > {prof['sharp_thr']:.0f} ц на нескольких ладах: "
                    "слишком высокая action. Опустите седла.")
-    if any(v.get('too_loud') for v in buzz.values()):
+    if any(v.get('too_loud') for v in res['buzz'].values()):
         out.append("ℹ️ На некоторых ладах атака была слишком сильной — перемерьте их мягче.")
     if len(out) == 1 and "норме" in out[0]:
         out.append("✅ Проблем по action/анкеру не обнаружено.")
@@ -415,7 +444,6 @@ for pos, (i, d) in enumerate(input_devs):
     except Exception:
         pass
 
-# ---- Сайдбар: устройство ----
 sel = st.sidebar.selectbox("Микрофон/вход", range(len(input_devs)), index=default_pos, format_func=dev_label)
 device_index = input_devs[sel][0]
 channel = st.sidebar.radio("Канал", [0, 1], index=0, help="0 = INSTRUMENT/Line 1, 1 = Line 2")
@@ -424,12 +452,10 @@ if st.sidebar.button("♻️ Перезапустить аудио"):
     st.cache_resource.clear()
     st.rerun()
 
-# ---- Сайдбар: инструмент ----
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🎸 Инструмент")
 tuning_name = st.sidebar.selectbox("Строй", list(TUNINGS.keys()))
-scale_name = st.sidebar.selectbox("Мензура", list(SCALES.keys()))
-scale_mm = SCALES[scale_name]
+scale_mm = SCALES[st.sidebar.selectbox("Мензура", list(SCALES.keys()))]
 set_name = st.sidebar.selectbox("Набор струн", list(GAUGE_SETS.keys()), index=1)
 gauges = dict(zip(range(1, 7), GAUGE_SETS[set_name]))
 if st.sidebar.checkbox("Задать калибры вручную"):
@@ -441,10 +467,14 @@ if not fresh:
     st.sidebar.warning("Старые струны дают негармоничные обертоны: точность питча и детектора дребезга снижена.")
 conf_min = 0.4 if fresh else 0.3
 
+st.sidebar.markdown("---")
+SENS = st.sidebar.slider("Чувствительность дребезга", 0.3, 4.0, 1.0, 0.1,
+                         help="Выше = ловит более слабый дребезг (больше ложных срабатываний). "
+                              "Если дребезг не находится — увеличьте.")
+
 targets = {s: STANDARD_TUNING[s] * 2 ** (TUNINGS[tuning_name][s] / 12) for s in range(1, 7)}
 profiles = {s: string_profile(s, gauges[s], targets[s], scale_mm) for s in range(1, 7)}
 
-# ---- Рекордер ----
 try:
     rec = get_recorder(device_index)
     rec.channel = channel
@@ -488,7 +518,7 @@ try:
                    f"({'обмоточная' if prof['wound'] else 'простая'}), цель {target:.2f} Гц, "
                    f"расчётное натяжение ≈ {prof['T']:.0f} Н, порог завышения {prof['sharp_thr']:.0f} ц")
 
-        # ---------- ШАГ 1: строй ----------
+        # ---------- ШАГ 1 ----------
         if st.session_state.step == 1:
             if 'open' not in res:
                 r = live_capture(rec, f"Шаг 1. Сыграйте открытую {string_num}-ю струну", target, conf_min=conf_min)
@@ -506,17 +536,15 @@ try:
                         st.session_state.step = 2
                         st.rerun()
                 else:
-                    if c0 < 0:
-                        hint = "Струна ниже нужной ноты — подтяните колок (увеличьте натяжение)."
-                    else:
-                        hint = "Струна выше нужной ноты — ослабьте колок (уменьшите натяжение)."
+                    hint = ("Струна ниже нужной ноты — подтяните колок (увеличьте натяжение)." if c0 < 0
+                            else "Струна выше нужной ноты — ослабьте колок (уменьшите натяжение).")
                     st.error(f"❌ Отклонение {c0:+.1f} ц (допуск ±{TUNE_TOL:.0f} ц). {hint}")
                     st.caption("Переход к Шагу 2 заблокирован до настройки. Подстройте и перемерьте.")
                     if st.button("🔄 Перемерить после настройки", type="primary"):
                         res.pop('open', None)
                         st.rerun()
 
-        # ---------- ШАГ 2а: флажолет ----------
+        # ---------- ШАГ 2а ----------
         elif st.session_state.step == 2:
             if 'open' not in res:
                 st.session_state.step = 1
@@ -538,7 +566,7 @@ try:
                     st.session_state.step = 2.5
                     st.rerun()
 
-        # ---------- ШАГ 2б: зажатая ----------
+        # ---------- ШАГ 2б ----------
         elif st.session_state.step == 2.5:
             open_f0 = res['open']['f0']
             if 'harm' not in res:
@@ -573,74 +601,84 @@ try:
                         st.rerun()
                     st.markdown("---")
                     st.markdown("**Готовы перейти к Шагу 3 (диагностика дребезга)?**")
-                    st.caption("Проверим лады 1, 5, 7, 9.")
+                    st.caption("Сначала запишем эталон (чистая открытая струна), затем лады 1, 5, 7, 9.")
                     if st.button("✅ Да, перейти к Шагу 3 →", type="primary"):
                         st.session_state.step = 3
                         st.rerun()
 
-        # ---------- ШАГ 3: дребезг ----------
+        # ---------- ШАГ 3 ----------
         elif st.session_state.step == 3:
             st.markdown("### Шаг 3. Диагностика дребезга")
-            st.caption("Играйте с умеренным нажатием. Нажимайте кнопку только когда готовы сыграть.")
-            frets_sequence = [1, 5, 7, 9]
+            st.caption("Эталон — чистая открытая струна: с ним сравниваются лады. Играйте с умеренным нажатием.")
             open_f0 = res['open']['f0']
 
             if st.session_state.current_fret is None:
                 st.markdown("---")
-                st.markdown("**Готовы начать диагностику дребезга?**")
-                if st.button("▶️ Начать с лада 1", type="primary"):
-                    st.session_state.current_fret = 1
+                st.markdown("**Начнём с эталона**")
+                if st.button("▶️ Записать эталон (открытая струна)", type="primary"):
+                    st.session_state.current_fret = 0
                     st.rerun()
             else:
                 cf = st.session_state.current_fret
                 if cf not in res['buzz']:
-                    b = capture_fret_buzz(rec, cf, open_f0, prof)
+                    b = capture_fret_buzz(rec, cf, open_f0, prof, res['buzz'].get(0))
                     if b:
                         res['buzz'][cf] = b
                         st.rerun()
+                    else:
+                        st.warning("Измерение не выполнено — это НЕ означает «чисто». Ударьте по струне заметно "
+                                   "сильнее фона и повторите.")
+                        st.button("🔄 Повторить")
                 else:
                     b = res['buzz'][cf]
-                    buzz = evaluate_buzz(b, prof)
-                    st.markdown(f"**Лад {cf}:** {'🔴 ДРЕБЕЗГ' if buzz else '🟢 Чисто'}")
-                    if b.get('jump') is None:
-                        st.caption("Атака не была зафиксирована — перемерьте.")
+                    base = res['buzz'].get(0)
+                    if cf == 0:
+                        st.markdown("**📏 Эталон записан**")
                     else:
-                        st.caption(f"Скачок центроида ×{b['jump']:.2f} | HF/F0 {b['hf']:.2f} | "
-                                   f"ZCR ×{b['zjump']:.2f} | завышение {b.get('sharp', 0):+.1f} ц | "
-                                   f"bend {b.get('bend', 0):+.1f} ц")
+                        state = evaluate_buzz(b, prof, base, SENS)
+                        st.markdown(f"**{fret_name(cf)}:** "
+                                    f"{'⚪ не измерено' if state is None else ('🔴 ДРЕБЕЗГ' if state else '🟢 Чисто')}")
+                    cap = f"nf {b['nf']:.3f} | hf {b['hf']:.4f}"
+                    if cf > 0 and base:
+                        cap += (f" | nf/эталон ×{b['nf'] / max(base['nf'], 0.02):.2f} (порог "
+                                f"×{NF_REL * prof['buzz_scale'] / SENS:.2f}) | hf/эталон ×"
+                                f"{b['hf'] / max(base['hf'], 1e-4):.2f} (порог ×{HF_REL * prof['buzz_scale'] / SENS:.2f})")
+                    cap += f" | завышение {b.get('sharp', 0):+.1f} ц | bend {b.get('bend', 0):+.1f} ц"
+                    st.caption(cap)
                     if b.get('too_loud'):
                         st.warning("Слишком сильная атака — сыграйте мягче и перемерьте.")
-                    if st.button(f"🔄 Перемерить лад {cf}"):
+                    if st.button(f"🔄 Перемерить: {fret_name(cf)}"):
                         del res['buzz'][cf]
                         st.rerun()
                     st.markdown("---")
-                    next_fret = next((f for f in frets_sequence if f not in res['buzz']), None)
+                    next_fret = next((f for f in FRETS_SEQ if f not in res['buzz']), None)
                     if next_fret is not None:
-                        st.markdown(f"**Готовы перейти к ладу {next_fret}?**")
-                        if st.button(f"▶️ Перейти к ладу {next_fret}", type="primary"):
+                        st.markdown(f"**Готовы перейти: {fret_name(next_fret)}?**")
+                        st.caption("Подготовьте руку, зажмите струну на нужном ладу, затем нажмите кнопку.")
+                        if st.button(f"▶️ Перейти: {fret_name(next_fret)}", type="primary"):
                             st.session_state.current_fret = next_fret
                             st.rerun()
                     else:
-                        st.success("✅ Все лады измерены!")
+                        st.success("✅ Все замеры выполнены!")
                         if st.button("📊 Показать итоги", type="primary"):
                             st.session_state.step = 4
                             st.session_state.current_fret = None
                             st.rerun()
 
-        # ---------- ШАГ 4: итоги ----------
+        # ---------- ШАГ 4 ----------
         elif st.session_state.step == 4:
             st.markdown("### Итоги диагностики")
             if 'open' in res:
                 st.metric("Строй", f"{(res['open'].get('cents') or 0):+.1f} центов")
             if 'intonation' in res:
                 st.metric("Дельта мензуры", f"{res['intonation']:+.1f} центов")
-            if len(res['buzz']) >= 4:
+            if all(f in res['buzz'] for f in TEST_FRETS):
                 st.markdown("**Тепловая карта:**")
                 cols = st.columns(4)
-                for i, f in enumerate([1, 5, 7, 9]):
-                    b = res['buzz'].get(f)
+                for i, f in enumerate(TEST_FRETS):
+                    state = buzz_state(res, f, prof)
                     cols[i].markdown(f"### Лад {f}")
-                    cols[i].markdown("🔴 ДРЕБЕЗГ" if evaluate_buzz(b, prof) else "🟢 Чисто")
+                    cols[i].markdown("⚪ не измерено" if state is None else ("🔴 ДРЕБЕЗГ" if state else "🟢 Чисто"))
                 st.markdown("### Рекомендации")
                 for r in recommendations(res, prof):
                     st.info(r)
